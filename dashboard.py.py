@@ -6,28 +6,25 @@ import numpy as np
 from datetime import datetime, timedelta
 
 # --- 1. ページ設定 ---
-st.set_page_config(layout="wide", page_title="FX Cockpit (ATR Filter)")
-st.title("⚡ FX Synthetic Cockpit (ATR Filter)")
+st.set_page_config(layout="wide", page_title="FX Cockpit (Smart Logic)")
+st.title("⚡ FX Cockpit (Trails & Smart Logic)")
 
-# --- 2. CSS ---
+# --- 2. Session State (記憶領域) の初期化 ---
+if 'forecast_history' not in st.session_state:
+    st.session_state.forecast_history = [] # 過去の予測点 [(time, price), ...]
+
+# --- 3. CSS ---
 st.markdown("""
     <style>
     .block-container {padding-top: 0.5rem; padding-bottom: 5rem;}
     [data-testid="stSidebar"] { min-width: 300px; }
-    .js-plotly-plot .plotly .main-svg { margin-top: 0px; margin-bottom: 0px; }
-    /* ステータスバッジのデザイン */
     .status-badge {
-        padding: 5px 10px;
-        border-radius: 5px;
-        font-weight: bold;
-        color: white;
-        text-align: center;
-        margin-bottom: 10px;
+        padding: 5px 10px; border-radius: 5px; font-weight: bold; color: white; text-align: center; margin-bottom: 10px;
     }
     </style>
 """, unsafe_allow_html=True)
 
-# --- 3. 分析対象設定 ---
+# --- 4. 設定 ---
 MAIN_TICKER = "USDJPY=X"
 SUB_TICKERS = [
     "EURUSD=X", "GBPUSD=X", "AUDUSD=X", "USDCHF=X", "USDCAD=X", "NZDUSD=X",
@@ -40,17 +37,16 @@ NAME_MAP = {
     "AUDJPY=X": "AUD/JPY", "EURGBP=X": "EUR/GBP", "AUDNZD=X": "AUD/NZD"
 }
 
-# --- 4. サイドバー ---
 st.sidebar.header("Control Panel")
 c_a1, c_a2 = st.sidebar.columns([1,2])
 auto_refresh = c_a1.toggle("Live", value=True)
 refresh_rate = c_a2.slider("Interval (sec)", 10, 60, 15)
-
 st.sidebar.divider()
-show_shadows = st.sidebar.checkbox("Shadows (Correlations)", value=True)
-show_forecast = st.sidebar.checkbox("Forecast Line", value=True)
+show_shadows = st.sidebar.checkbox("Shadows", value=True)
+show_forecast = st.sidebar.checkbox("Forecast Arrow", value=True)
+show_trails = st.sidebar.checkbox("Forecast Trails (History)", value=True)
 
-# --- 5. データ取得 ---
+# --- 5. データ取得 & 計算 ---
 
 def clean_df(df):
     if df is None or df.empty: return df
@@ -66,7 +62,7 @@ def clean_df(df):
 @st.cache_data(ttl=15, show_spinner=False)
 def fetch_main_ticker():
     try:
-        # ATR計算のために少し長めに取る
+        # テクニカル計算用に少し長めに
         df = yf.download(MAIN_TICKER, period="5d", interval="1m", progress=False)
         return clean_df(df)
     except: return None
@@ -96,85 +92,105 @@ def extract_from_bulk(bulk_data, ticker):
         return pd.DataFrame()
     except: return pd.DataFrame()
 
-# --- 6. 分析ロジック (ATR追加) ---
+# --- テクニカル指標 (ブレーキ役) ---
 
-def calculate_atr(df, period=14):
-    """ATR (Average True Range) を計算"""
-    high_low = df['High'] - df['Low']
-    high_close = np.abs(df['High'] - df['Close'].shift())
-    low_close = np.abs(df['Low'] - df['Close'].shift())
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    true_range = ranges.max(axis=1)
-    atr = true_range.rolling(period).mean()
-    return atr
-
-def get_market_status(df):
-    """ATRに基づいて市場の状態を判定"""
-    if len(df) < 100: return "UNKNOWN", "#888888", 0
+def calculate_technical_filters(df):
+    """RSIとボリンジャーバンドを計算し、ブレーキ係数(0.0~1.0)を返す"""
+    if len(df) < 20: return 1.0, [] # データ不足ならブレーキなし
     
-    atr = calculate_atr(df)
-    current_atr = atr.iloc[-1]
+    close = df['Close']
+    reasons = []
+    brake_factor = 1.0 # 1.0=ブレーキなし, 0.0=急停止
     
-    # 過去24時間の平均ATRと比較
-    # 1分足なので 60*24 = 1440本だが、直近数時間の平均と比較する
-    recent_mean_atr = atr.iloc[-300:].mean() # 直近5時間の平均
+    # 1. RSI (14)
+    delta = close.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    current_rsi = rsi.iloc[-1]
     
-    if np.isnan(current_atr) or np.isnan(recent_mean_atr): return "UNKNOWN", "#888888", 0
-    
-    ratio = current_atr / recent_mean_atr
-    
-    status = "ACTIVE"
-    color = "#2ECC40" # Green
-    
-    if ratio < 0.6: # 平均の60%未満しかない
-        status = "DEAD (No Volatility)"
-        color = "#FF4136" # Red
-    elif ratio > 2.0: # 平均の2倍以上暴れている
-        status = "VOLATILE (Caution)"
-        color = "#FF851B" # Orange
+    if current_rsi > 70:
+        reasons.append(f"RSI Overbought({current_rsi:.0f})")
+        brake_factor *= 0.5 # 買い圧力を半減
+    elif current_rsi < 30:
+        reasons.append(f"RSI Oversold({current_rsi:.0f})")
+        brake_factor *= 0.5 # 売り圧力を半減 (逆張りにはしない)
         
-    return status, color, ratio
+    # 2. Bollinger Bands (20, 2sigma)
+    sma = close.rolling(20).mean()
+    std = close.rolling(20).std()
+    upper = sma + (std * 2)
+    lower = sma - (std * 2)
+    c = close.iloc[-1]
+    
+    if c > upper.iloc[-1]:
+        reasons.append("BB Upper Touch")
+        brake_factor *= 0.3 # 強くブレーキ
+    elif c < lower.iloc[-1]:
+        reasons.append("BB Lower Touch")
+        brake_factor *= 0.3
+        
+    return brake_factor, reasons
 
-def get_correlations(base_df, bulk_1m):
+def calculate_atr_status(df):
+    if len(df) < 100: return "UNKNOWN", "#888888", 0
+    tr = np.maximum(df['High'] - df['Low'], 
+           np.maximum(np.abs(df['High'] - df['Close'].shift()), 
+                      np.abs(df['Low'] - df['Close'].shift())))
+    atr = tr.rolling(14).mean()
+    curr, mean = atr.iloc[-1], atr.iloc[-300:].mean()
+    if np.isnan(curr) or np.isnan(mean) or mean == 0: return "UNKNOWN", "#888888", 0
+    
+    ratio = curr / mean
+    if ratio < 0.6: return "DEAD (Low Vol)", "#FF4136", ratio
+    elif ratio > 2.0: return "VOLATILE", "#FF851B", ratio
+    return "ACTIVE", "#2ECC40", ratio
+
+def get_correlations_and_trends(main_df, bulk_1m, bulk_1h):
+    # 相関リスト作成
     corrs = {}
-    base_ret = base_df['Close'].pct_change()
-    for ticker in SUB_TICKERS:
-        df = extract_from_bulk(bulk_1m, ticker)
+    base_ret = main_df['Close'].pct_change()
+    for tk in SUB_TICKERS:
+        df = extract_from_bulk(bulk_1m, tk)
         if df.empty: continue
-        aligned = df['Close'].reindex(base_df.index, method='ffill').fillna(method='bfill')
+        aligned = df['Close'].reindex(main_df.index, method='ffill').fillna(method='bfill')
         if len(aligned) < 30: continue
-        corr = base_ret.corr(aligned.pct_change())
-        if not np.isnan(corr): corrs[ticker] = corr
+        c = base_ret.corr(aligned.pct_change())
+        if not np.isnan(c): corrs[tk] = c
+            
     pos = sorted([(k, v) for k, v in corrs.items() if v > 0], key=lambda x: x[1], reverse=True)[:2]
     neg = sorted([(k, v) for k, v in corrs.items() if v < 0], key=lambda x: x[1])[:2]
-    return pos, neg
+    
+    # 圧力計算
+    pressure = 0
+    logs = []
+    
+    # helper for trend
+    def get_trend(df):
+        c, m5, m13 = df['Close'].iloc[-1], df['Close'].rolling(5).mean().iloc[-1], df['Close'].rolling(13).mean().iloc[-1]
+        score = 0
+        if m5 > m13: score = 1
+        elif m5 < m13: score = -1
+        if c > m5: score += 1
+        elif c < m5: score -= 1
+        return score
 
-def analyze_trend(df):
-    if len(df) < 30: return 0, ""
-    score = 0
-    reasons = []
-    def v(s): return float(s.iloc[-1].item()) if isinstance(s.iloc[-1], (pd.Series, np.ndarray)) else float(s.iloc[-1])
-    c, m5, m13, m25 = v(df['Close']), v(df['Close'].rolling(5).mean()), v(df['Close'].rolling(13).mean()), v(df['Close'].rolling(25).mean())
-    if m5 > m13 > m25: score += 2; reasons.append("MA↑")
-    elif m5 < m13 < m25: score -= 2; reasons.append("MA↓")
-    if c > m5: score += 1
-    elif c < m5: score -= 1
-    return score, ",".join(reasons)
-
-def calc_power(bulk_1h):
-    scores = {"USD": 0, "JPY": 0, "EUR": 0, "GBP": 0, "AUD": 0}
-    def chg(tk):
+    for tk, corr in pos:
         df = extract_from_bulk(bulk_1h, tk)
-        if df.empty: return 0
-        try: return (float(df['Close'].iloc[-1]) - float(df['Open'].iloc[-1])) / float(df['Open'].iloc[-1]) * 100
-        except: return 0
-    uj, eu, gu, au = chg("USDJPY=X"), chg("EURUSD=X"), chg("GBPUSD=X"), chg("AUDUSD=X")
-    scores["USD"] += uj - eu - gu - au
-    scores["JPY"] -= uj
-    scores["EUR"] += eu
-    scores["GBP"] += gu
-    scores["AUD"] += au
-    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        if not df.empty:
+            s = get_trend(df)
+            pressure += s * corr
+            logs.append(f"📈 {NAME_MAP.get(tk,tk)}({corr:.2f})")
+            
+    for tk, corr in neg:
+        df = extract_from_bulk(bulk_1h, tk)
+        if not df.empty:
+            s = get_trend(df)
+            pressure += s * corr # 負の相関 x 下落(-Score) = プラス圧力
+            logs.append(f"📉 {NAME_MAP.get(tk,tk)}({corr:.2f})")
+            
+    return pressure, logs, pos, neg
 
 def normalize(target, base, invert=False):
     aligned = target.reindex(base.index, method='ffill').fillna(method='bfill')
@@ -185,91 +201,109 @@ def normalize(target, base, invert=False):
     if invert: norm = b_mean - (norm - b_mean)
     return norm
 
-# --- 7. メイン処理 ---
+# --- 6. メイン処理 ---
 
 @st.fragment(run_every=refresh_rate if auto_refresh else None)
 def render_dashboard():
     st.caption(f"Last Update: {datetime.now().strftime('%H:%M:%S')}")
-
+    
     main_df = fetch_main_ticker()
     if main_df is None or main_df.empty:
         st.error("Waiting for Data...")
         return
 
-    # ★ ATR判定
-    status_text, status_color, atr_ratio = get_market_status(main_df)
-
-    # チャート範囲計算 (直近60本)
+    # ステータス判定
+    status, status_col, atr_ratio = calculate_atr_status(main_df)
+    brake_factor, brake_reasons = calculate_technical_filters(main_df)
+    
+    # データ準備
     df_jst = main_df.copy()
     df_jst.index = df_jst.index + timedelta(hours=9)
     visible_df = df_jst.iloc[-60:]
     y_min, y_max = visible_df['Low'].min(), visible_df['High'].max()
     y_pad = (y_max - y_min) * 0.2 if (y_max - y_min) > 0 else 0.05
+
+    bulk_1m, bulk_1h = fetch_sub_tickers_1m(), fetch_sub_tickers_1h()
     
-    # チャート
+    pressure = 0
+    logs = []
+    pos_top2, neg_top2 = [], []
+    
+    if bulk_1m is not None and bulk_1h is not None:
+        pressure, logs, pos_top2, neg_top2 = get_correlations_and_trends(main_df, bulk_1m, bulk_1h)
+        
+    # --- 最終決定 (Smart Logic) ---
+    # 1. ブレーキ適用
+    final_pressure = pressure * brake_factor
+    
+    # 2. ATRフィルター (DEADならゼロ)
+    if status.startswith("DEAD"):
+        final_pressure = 0
+        
+    # 3. 履歴保存 (Trails)
+    last_t = df_jst.index[-1]
+    last_p = float(df_jst['Close'].iloc[-1])
+    vol = float(df_jst['Close'].diff().std()) * 15
+    if np.isnan(vol): vol = 0.05
+    fut_t = last_t + timedelta(minutes=30)
+    fut_p = last_p + (final_pressure * vol * 0.3)
+    
+    # 重複保存を防ぐ (時刻が変わった時だけ保存)
+    history = st.session_state.forecast_history
+    if not history or history[-1][0] != fut_t:
+        # 値動きがある程度ある場合のみ記録 (ゴミデータを防ぐ)
+        if abs(final_pressure) > 0.5: 
+            history.append((fut_t, fut_p))
+            # 履歴は最新20個まで
+            if len(history) > 20: history.pop(0)
+            st.session_state.forecast_history = history
+
+    # --- 描画 ---
     fig = go.Figure()
+    
+    # Candle
     fig.add_trace(go.Candlestick(
         x=df_jst.index, open=df_jst['Open'], high=df_jst['High'], low=df_jst['Low'], close=df_jst['Close'],
         name='USD/JPY', increasing_line_color='#FF4136', decreasing_line_color='#0074D9'
     ))
-
-    # 分析
-    bulk_1m, bulk_1h = fetch_sub_tickers_1m(), fetch_sub_tickers_1h()
-    analysis_ready = False
-    pos_top2, neg_top2 = [], []
-    power_ranking = []
-    total_pressure = 0
-    analysis_log = []
-
-    if bulk_1m is not None and not bulk_1m.empty and bulk_1h is not None and not bulk_1h.empty:
-        analysis_ready = True
-        pos_top2, neg_top2 = get_correlations(main_df, bulk_1m)
-        power_ranking = calc_power(bulk_1h)
-        for tk, corr in pos_top2:
-            df = extract_from_bulk(bulk_1h, tk)
-            if not df.empty:
-                s, r = analyze_trend(df)
-                total_pressure += s * corr
-                analysis_log.append(f"📈 {NAME_MAP.get(tk,tk)}({corr:.2f}): {r}")
-        for tk, corr in neg_top2:
-            df = extract_from_bulk(bulk_1h, tk)
-            if not df.empty:
-                s, r = analyze_trend(df)
-                total_pressure += s * corr
-                analysis_log.append(f"📉 {NAME_MAP.get(tk,tk)}({corr:.2f}): {r}")
-
-    # 相関と予測
-    if analysis_ready and show_shadows:
+    
+    # Shadows
+    if show_shadows and bulk_1m is not None:
         cols = ['#FFA500', '#FFD700']
-        for i, (tk, corr) in enumerate(pos_top2):
+        for i, (tk, c) in enumerate(pos_top2):
             df = extract_from_bulk(bulk_1m, tk)
             if not df.empty:
-                shad = normalize(df['Close'], main_df['Close'], False)
-                shad.index += timedelta(hours=9)
-                fig.add_trace(go.Scatter(x=shad.index, y=shad, mode='lines', name=NAME_MAP.get(tk,tk), line=dict(color=cols[i], width=1), opacity=0.6))
+                s = normalize(df['Close'], main_df['Close'], False)
+                s.index += timedelta(hours=9)
+                fig.add_trace(go.Scatter(x=s.index, y=s, mode='lines', name=NAME_MAP.get(tk,tk), line=dict(color=cols[i], width=1), opacity=0.6))
         cols = ['#00FFFF', '#1E90FF']
-        for i, (tk, corr) in enumerate(neg_top2):
+        for i, (tk, c) in enumerate(neg_top2):
             df = extract_from_bulk(bulk_1m, tk)
             if not df.empty:
-                shad = normalize(df['Close'], main_df['Close'], True)
-                shad.index += timedelta(hours=9)
-                fig.add_trace(go.Scatter(x=shad.index, y=shad, mode='lines', name=NAME_MAP.get(tk,tk)+"(Inv)", line=dict(color=cols[i], width=1, dash='dot'), opacity=0.6))
+                s = normalize(df['Close'], main_df['Close'], True)
+                s.index += timedelta(hours=9)
+                fig.add_trace(go.Scatter(x=s.index, y=s, mode='lines', name=NAME_MAP.get(tk,tk)+"(Inv)", line=dict(color=cols[i], width=1, dash='dot'), opacity=0.6))
 
-    if analysis_ready and show_forecast:
-        # ★ ATRが低すぎる(DEAD)ときは、予測線を消すか、灰色にする処理
-        forecast_color = "#32CD32" if total_pressure > 0 else "#FF00FF"
-        if status_text.startswith("DEAD"):
-            forecast_color = "#888888" # 無効色
-            total_pressure = 0 # 圧力なしとみなす
+    # Trails (Ghost)
+    if show_trails:
+        # 過去の予測点を表示
+        trail_x = [h[0] for h in history]
+        trail_y = [h[1] for h in history]
+        fig.add_trace(go.Scatter(
+            x=trail_x, y=trail_y, mode='markers', 
+            name='Past Forecasts', marker=dict(color='rgba(255, 255, 255, 0.3)', size=4, symbol='x')
+        ))
 
-        last_t = df_jst.index[-1]
-        last_p = float(df_jst['Close'].iloc[-1])
-        fut_t = last_t + timedelta(minutes=30)
-        vol = float(df_jst['Close'].diff().std()) * 15
-        if np.isnan(vol): vol = 0.05
-        fut_p = last_p + (total_pressure * vol * 0.3)
+    # Forecast Arrow
+    if show_forecast:
+        col = "#32CD32" if final_pressure > 0 else "#FF00FF"
+        if final_pressure == 0: col = "#888888" # 無効
         
-        fig.add_trace(go.Scatter(x=[last_t, fut_t], y=[last_p, fut_p], mode='lines+markers', marker=dict(symbol='arrow-right', size=10), name='Forecast', line=dict(color=forecast_color, width=4, dash='dash')))
+        fig.add_trace(go.Scatter(
+            x=[last_t, fut_t], y=[last_p, fut_p], 
+            mode='lines+markers', marker=dict(symbol='arrow-right', size=10),
+            name='Forecast', line=dict(color=col, width=4, dash='dash')
+        ))
 
     fig.update_layout(
         height=700, template="plotly_dark",
@@ -280,33 +314,27 @@ def render_dashboard():
     
     c_chart, c_info = st.columns([3, 1])
     with c_chart:
-        # ★ Market Status Badge
-        st.markdown(f"<div class='status-badge' style='background-color:{status_color};'>MARKET STATUS: {status_text} (ATR Ratio: {atr_ratio:.2f})</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='status-badge' style='background-color:{status_col};'>MARKET: {status} (ATR Ratio: {atr_ratio:.2f})</div>", unsafe_allow_html=True)
         st.plotly_chart(fig, use_container_width=True)
         
     with c_info:
-        if analysis_ready:
-            st.subheader("🤖 AI Decision")
-            if status_text.startswith("DEAD"):
-                st.warning("NO TRADE (Low Volatility)") # トレード禁止表示
-            else:
-                if total_pressure > 3: st.success(f"STRONG BUY ({total_pressure:.1f})")
-                elif total_pressure > 0: st.info(f"BUY ({total_pressure:.1f})")
-                elif total_pressure < -3: st.error(f"STRONG SELL ({total_pressure:.1f})")
-                else: st.warning(f"NEUTRAL ({total_pressure:.1f})")
-            
-            st.divider()
-            st.subheader("💪 Power")
-            max_s = max([abs(x[1]) for x in power_ranking]) if power_ranking else 1
-            for ccy, sc in power_ranking:
-                norm = sc / max_s if max_s != 0 else 0
-                bg = "#FF4136" if sc > 0 else "#0074D9"
-                st.write(f"**{ccy}**")
-                st.markdown(f"<div style='background:{bg};width:{abs(norm)*100}%;height:6px;border-radius:3px;'></div>", unsafe_allow_html=True)
-            st.divider()
-            st.caption("Drivers")
-            for l in analysis_log: st.text(l)
+        st.subheader("🤖 AI Decision")
+        if final_pressure == 0:
+            if status.startswith("DEAD"): st.warning("NO TRADE (Low Vol)")
+            elif brake_factor < 1.0: st.warning(f"BLOCKED BY TECH\n({', '.join(brake_reasons)})")
+            else: st.warning("NEUTRAL")
         else:
-            st.info("Initializing...")
+            p_text = f"{final_pressure:.1f}"
+            if final_pressure > 3: st.success(f"STRONG BUY ({p_text})")
+            elif final_pressure > 0: st.info(f"BUY ({p_text})")
+            elif final_pressure < -3: st.error(f"STRONG SELL ({p_text})")
+            else: st.warning(f"SELL ({p_text})")
+            
+        if brake_factor < 1.0:
+            st.caption(f"⚠️ Warning: {', '.join(brake_reasons)}")
+            
+        st.divider()
+        st.caption("Correlation Drivers")
+        for l in logs: st.text(l)
 
 render_dashboard()
