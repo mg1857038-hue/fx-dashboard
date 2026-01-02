@@ -6,12 +6,12 @@ import numpy as np
 from datetime import datetime, timedelta
 
 # --- 1. ページ設定 ---
-st.set_page_config(layout="wide", page_title="FX Cockpit (Smart Logic)")
-st.title("⚡ FX Cockpit (Trails & Smart Logic)")
+st.set_page_config(layout="wide", page_title="FX Cockpit (Visible Trails)")
+st.title("⚡ FX Cockpit (Visible Trails Ver.)")
 
-# --- 2. Session State (記憶領域) の初期化 ---
+# --- 2. Session State (記憶領域) ---
 if 'forecast_history' not in st.session_state:
-    st.session_state.forecast_history = [] # 過去の予測点 [(time, price), ...]
+    st.session_state.forecast_history = [] 
 
 # --- 3. CSS ---
 st.markdown("""
@@ -46,7 +46,7 @@ show_shadows = st.sidebar.checkbox("Shadows", value=True)
 show_forecast = st.sidebar.checkbox("Forecast Arrow", value=True)
 show_trails = st.sidebar.checkbox("Forecast Trails (History)", value=True)
 
-# --- 5. データ取得 & 計算 ---
+# --- 5. データ取得 ---
 
 def clean_df(df):
     if df is None or df.empty: return df
@@ -62,7 +62,6 @@ def clean_df(df):
 @st.cache_data(ttl=15, show_spinner=False)
 def fetch_main_ticker():
     try:
-        # テクニカル計算用に少し長めに
         df = yf.download(MAIN_TICKER, period="5d", interval="1m", progress=False)
         return clean_df(df)
     except: return None
@@ -92,17 +91,15 @@ def extract_from_bulk(bulk_data, ticker):
         return pd.DataFrame()
     except: return pd.DataFrame()
 
-# --- テクニカル指標 (ブレーキ役) ---
+# --- 6. 計算ロジック ---
 
 def calculate_technical_filters(df):
-    """RSIとボリンジャーバンドを計算し、ブレーキ係数(0.0~1.0)を返す"""
-    if len(df) < 20: return 1.0, [] # データ不足ならブレーキなし
-    
+    if len(df) < 20: return 1.0, []
     close = df['Close']
     reasons = []
-    brake_factor = 1.0 # 1.0=ブレーキなし, 0.0=急停止
+    brake_factor = 1.0
     
-    # 1. RSI (14)
+    # RSI
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -111,13 +108,13 @@ def calculate_technical_filters(df):
     current_rsi = rsi.iloc[-1]
     
     if current_rsi > 70:
-        reasons.append(f"RSI Overbought({current_rsi:.0f})")
-        brake_factor *= 0.5 # 買い圧力を半減
+        reasons.append(f"RSI Over({current_rsi:.0f})")
+        brake_factor *= 0.5
     elif current_rsi < 30:
-        reasons.append(f"RSI Oversold({current_rsi:.0f})")
-        brake_factor *= 0.5 # 売り圧力を半減 (逆張りにはしない)
-        
-    # 2. Bollinger Bands (20, 2sigma)
+        reasons.append(f"RSI Under({current_rsi:.0f})")
+        brake_factor *= 0.5
+
+    # BB
     sma = close.rolling(20).mean()
     std = close.rolling(20).std()
     upper = sma + (std * 2)
@@ -125,10 +122,10 @@ def calculate_technical_filters(df):
     c = close.iloc[-1]
     
     if c > upper.iloc[-1]:
-        reasons.append("BB Upper Touch")
-        brake_factor *= 0.3 # 強くブレーキ
+        reasons.append("BB High")
+        brake_factor *= 0.3
     elif c < lower.iloc[-1]:
-        reasons.append("BB Lower Touch")
+        reasons.append("BB Low")
         brake_factor *= 0.3
         
     return brake_factor, reasons
@@ -148,7 +145,6 @@ def calculate_atr_status(df):
     return "ACTIVE", "#2ECC40", ratio
 
 def get_correlations_and_trends(main_df, bulk_1m, bulk_1h):
-    # 相関リスト作成
     corrs = {}
     base_ret = main_df['Close'].pct_change()
     for tk in SUB_TICKERS:
@@ -162,11 +158,9 @@ def get_correlations_and_trends(main_df, bulk_1m, bulk_1h):
     pos = sorted([(k, v) for k, v in corrs.items() if v > 0], key=lambda x: x[1], reverse=True)[:2]
     neg = sorted([(k, v) for k, v in corrs.items() if v < 0], key=lambda x: x[1])[:2]
     
-    # 圧力計算
     pressure = 0
     logs = []
     
-    # helper for trend
     def get_trend(df):
         c, m5, m13 = df['Close'].iloc[-1], df['Close'].rolling(5).mean().iloc[-1], df['Close'].rolling(13).mean().iloc[-1]
         score = 0
@@ -187,7 +181,7 @@ def get_correlations_and_trends(main_df, bulk_1m, bulk_1h):
         df = extract_from_bulk(bulk_1h, tk)
         if not df.empty:
             s = get_trend(df)
-            pressure += s * corr # 負の相関 x 下落(-Score) = プラス圧力
+            pressure += s * corr
             logs.append(f"📉 {NAME_MAP.get(tk,tk)}({corr:.2f})")
             
     return pressure, logs, pos, neg
@@ -201,7 +195,7 @@ def normalize(target, base, invert=False):
     if invert: norm = b_mean - (norm - b_mean)
     return norm
 
-# --- 6. メイン処理 ---
+# --- 7. メイン処理 ---
 
 @st.fragment(run_every=refresh_rate if auto_refresh else None)
 def render_dashboard():
@@ -212,11 +206,9 @@ def render_dashboard():
         st.error("Waiting for Data...")
         return
 
-    # ステータス判定
     status, status_col, atr_ratio = calculate_atr_status(main_df)
     brake_factor, brake_reasons = calculate_technical_filters(main_df)
     
-    # データ準備
     df_jst = main_df.copy()
     df_jst.index = df_jst.index + timedelta(hours=9)
     visible_df = df_jst.iloc[-60:]
@@ -232,15 +224,12 @@ def render_dashboard():
     if bulk_1m is not None and bulk_1h is not None:
         pressure, logs, pos_top2, neg_top2 = get_correlations_and_trends(main_df, bulk_1m, bulk_1h)
         
-    # --- 最終決定 (Smart Logic) ---
-    # 1. ブレーキ適用
     final_pressure = pressure * brake_factor
     
-    # 2. ATRフィルター (DEADならゼロ)
     if status.startswith("DEAD"):
         final_pressure = 0
         
-    # 3. 履歴保存 (Trails)
+    # --- 履歴保存 (条件緩和版) ---
     last_t = df_jst.index[-1]
     last_p = float(df_jst['Close'].iloc[-1])
     vol = float(df_jst['Close'].diff().std()) * 15
@@ -248,26 +237,21 @@ def render_dashboard():
     fut_t = last_t + timedelta(minutes=30)
     fut_p = last_p + (final_pressure * vol * 0.3)
     
-    # 重複保存を防ぐ (時刻が変わった時だけ保存)
     history = st.session_state.forecast_history
+    # 毎回記録する（閾値撤廃）
     if not history or history[-1][0] != fut_t:
-        # 値動きがある程度ある場合のみ記録 (ゴミデータを防ぐ)
-        if abs(final_pressure) > 0.5: 
-            history.append((fut_t, fut_p))
-            # 履歴は最新20個まで
-            if len(history) > 20: history.pop(0)
-            st.session_state.forecast_history = history
+        history.append((fut_t, fut_p))
+        if len(history) > 30: history.pop(0)
+        st.session_state.forecast_history = history
 
     # --- 描画 ---
     fig = go.Figure()
     
-    # Candle
     fig.add_trace(go.Candlestick(
         x=df_jst.index, open=df_jst['Open'], high=df_jst['High'], low=df_jst['Low'], close=df_jst['Close'],
         name='USD/JPY', increasing_line_color='#FF4136', decreasing_line_color='#0074D9'
     ))
     
-    # Shadows
     if show_shadows and bulk_1m is not None:
         cols = ['#FFA500', '#FFD700']
         for i, (tk, c) in enumerate(pos_top2):
@@ -284,21 +268,19 @@ def render_dashboard():
                 s.index += timedelta(hours=9)
                 fig.add_trace(go.Scatter(x=s.index, y=s, mode='lines', name=NAME_MAP.get(tk,tk)+"(Inv)", line=dict(color=cols[i], width=1, dash='dot'), opacity=0.6))
 
-    # Trails (Ghost)
-    if show_trails:
-        # 過去の予測点を表示
+    # ★ Trails (修正版: 黄色で大きく)
+    if show_trails and history:
         trail_x = [h[0] for h in history]
         trail_y = [h[1] for h in history]
         fig.add_trace(go.Scatter(
             x=trail_x, y=trail_y, mode='markers', 
-            name='Past Forecasts', marker=dict(color='rgba(255, 255, 255, 0.3)', size=4, symbol='x')
+            name='Trails', 
+            marker=dict(color='yellow', size=8, symbol='x', line=dict(width=2, color='white')) # 目立つように修正
         ))
 
-    # Forecast Arrow
     if show_forecast:
         col = "#32CD32" if final_pressure > 0 else "#FF00FF"
-        if final_pressure == 0: col = "#888888" # 無効
-        
+        if final_pressure == 0: col = "#888888"
         fig.add_trace(go.Scatter(
             x=[last_t, fut_t], y=[last_p, fut_p], 
             mode='lines+markers', marker=dict(symbol='arrow-right', size=10),
