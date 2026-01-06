@@ -6,10 +6,10 @@ import numpy as np
 from datetime import datetime, timedelta
 
 # --- 1. ページ設定 ---
-st.set_page_config(layout="wide", page_title="FX Cockpit (Visible Trails)")
-st.title("⚡ FX Cockpit (Visible Trails Ver.)")
+st.set_page_config(layout="wide", page_title="FX Cockpit (yfinance Ver.)")
+st.title("⚡ FX Cockpit (Evolution Ver.)")
 
-# --- 2. Session State (記憶領域) ---
+# --- 2. Session State ---
 if 'forecast_history' not in st.session_state:
     st.session_state.forecast_history = [] 
 
@@ -44,9 +44,9 @@ refresh_rate = c_a2.slider("Interval (sec)", 10, 60, 15)
 st.sidebar.divider()
 show_shadows = st.sidebar.checkbox("Shadows", value=True)
 show_forecast = st.sidebar.checkbox("Forecast Arrow", value=True)
-show_trails = st.sidebar.checkbox("Forecast Trails (History)", value=True)
+show_trails = st.sidebar.checkbox("Trails (History)", value=True)
 
-# --- 5. データ取得 ---
+# --- 5. データ取得 (yfinance) ---
 
 def clean_df(df):
     if df is None or df.empty: return df
@@ -91,7 +91,7 @@ def extract_from_bulk(bulk_data, ticker):
         return pd.DataFrame()
     except: return pd.DataFrame()
 
-# --- 6. 計算ロジック ---
+# --- 6. 計算ロジック (ATR / ブレーキ / 軌跡) ---
 
 def calculate_technical_filters(df):
     if len(df) < 20: return 1.0, []
@@ -199,7 +199,7 @@ def normalize(target, base, invert=False):
 
 @st.fragment(run_every=refresh_rate if auto_refresh else None)
 def render_dashboard():
-    st.caption(f"Last Update: {datetime.now().strftime('%H:%M:%S')}")
+    st.caption(f"Last Update: {datetime.now().strftime('%H:%M:%S')} (Source: yfinance)")
     
     main_df = fetch_main_ticker()
     if main_df is None or main_df.empty:
@@ -209,6 +209,7 @@ def render_dashboard():
     status, status_col, atr_ratio = calculate_atr_status(main_df)
     brake_factor, brake_reasons = calculate_technical_filters(main_df)
     
+    # 日本時間調整 & 範囲
     df_jst = main_df.copy()
     df_jst.index = df_jst.index + timedelta(hours=9)
     visible_df = df_jst.iloc[-60:]
@@ -225,11 +226,9 @@ def render_dashboard():
         pressure, logs, pos_top2, neg_top2 = get_correlations_and_trends(main_df, bulk_1m, bulk_1h)
         
     final_pressure = pressure * brake_factor
-    
-    if status.startswith("DEAD"):
-        final_pressure = 0
+    if status.startswith("DEAD"): final_pressure = 0
         
-    # --- 履歴保存 (条件緩和版) ---
+    # Trails
     last_t = df_jst.index[-1]
     last_p = float(df_jst['Close'].iloc[-1])
     vol = float(df_jst['Close'].diff().std()) * 15
@@ -238,15 +237,13 @@ def render_dashboard():
     fut_p = last_p + (final_pressure * vol * 0.3)
     
     history = st.session_state.forecast_history
-    # 毎回記録する（閾値撤廃）
     if not history or history[-1][0] != fut_t:
         history.append((fut_t, fut_p))
         if len(history) > 30: history.pop(0)
         st.session_state.forecast_history = history
 
-    # --- 描画 ---
+    # Draw
     fig = go.Figure()
-    
     fig.add_trace(go.Candlestick(
         x=df_jst.index, open=df_jst['Open'], high=df_jst['High'], low=df_jst['Low'], close=df_jst['Close'],
         name='USD/JPY', increasing_line_color='#FF4136', decreasing_line_color='#0074D9'
@@ -268,14 +265,12 @@ def render_dashboard():
                 s.index += timedelta(hours=9)
                 fig.add_trace(go.Scatter(x=s.index, y=s, mode='lines', name=NAME_MAP.get(tk,tk)+"(Inv)", line=dict(color=cols[i], width=1, dash='dot'), opacity=0.6))
 
-    # ★ Trails (修正版: 黄色で大きく)
     if show_trails and history:
         trail_x = [h[0] for h in history]
         trail_y = [h[1] for h in history]
         fig.add_trace(go.Scatter(
-            x=trail_x, y=trail_y, mode='markers', 
-            name='Trails', 
-            marker=dict(color='yellow', size=8, symbol='x', line=dict(width=2, color='white')) # 目立つように修正
+            x=trail_x, y=trail_y, mode='markers', name='Trails', 
+            marker=dict(color='yellow', size=8, symbol='x', line=dict(width=2, color='white'))
         ))
 
     if show_forecast:
@@ -301,22 +296,19 @@ def render_dashboard():
         
     with c_info:
         st.subheader("🤖 AI Decision")
+        p_text = f"{final_pressure:.1f}"
         if final_pressure == 0:
             if status.startswith("DEAD"): st.warning("NO TRADE (Low Vol)")
             elif brake_factor < 1.0: st.warning(f"BLOCKED BY TECH\n({', '.join(brake_reasons)})")
             else: st.warning("NEUTRAL")
-        else:
-            p_text = f"{final_pressure:.1f}"
-            if final_pressure > 3: st.success(f"STRONG BUY ({p_text})")
-            elif final_pressure > 0: st.info(f"BUY ({p_text})")
-            elif final_pressure < -3: st.error(f"STRONG SELL ({p_text})")
-            else: st.warning(f"SELL ({p_text})")
+        elif final_pressure > 3: st.success(f"STRONG BUY ({p_text})")
+        elif final_pressure > 0: st.info(f"BUY ({p_text})")
+        elif final_pressure < -3: st.error(f"STRONG SELL ({p_text})")
+        else: st.warning(f"SELL ({p_text})")
             
-        if brake_factor < 1.0:
-            st.caption(f"⚠️ Warning: {', '.join(brake_reasons)}")
-            
+        if brake_factor < 1.0: st.caption(f"⚠️ {', '.join(brake_reasons)}")
         st.divider()
-        st.caption("Correlation Drivers")
+        st.caption("Drivers")
         for l in logs: st.text(l)
 
 render_dashboard()
